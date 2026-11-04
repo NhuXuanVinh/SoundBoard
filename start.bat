@@ -15,7 +15,7 @@ if not exist ".venv\Scripts\python.exe" (
     goto failed
 )
 :environment_ready
-".venv\Scripts\python.exe" -c "import PySide6, numpy, scipy, sounddevice, soundfile" >nul 2>&1
+".venv\Scripts\python.exe" -c "import PySide6, numpy, scipy, sounddevice, soundfile; from soundboard.noise import RNNoiseFilter; f = RNNoiseFilter(); f.close()" >nul 2>&1
 if errorlevel 1 (
     echo Installing soundboard dependencies...
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt

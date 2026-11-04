@@ -13,6 +13,8 @@ from scipy.signal import resample_poly
 import sounddevice as sd
 import soundfile as sf
 
+from .noise import MicrophoneProcessor, SAMPLE_RATE
+
 
 MAX_CLIP_BYTES = 128 * 1024 * 1024
 
@@ -44,6 +46,16 @@ def devices():
     # WASAPI gives full endpoint names and avoids duplicate MME/DirectSound entries.
     wasapi = [d for d in result if d.api == 'Windows WASAPI']
     return wasapi or result
+
+
+def device_settings(device):
+    """Let Windows convert shared-mode endpoint formats without changing defaults."""
+    return sd.WasapiSettings(auto_convert=True) if device.api == 'Windows WASAPI' else None
+
+
+def is_virtual_device(device):
+    return any(term in device.name.lower() for term in
+               ('cable', 'voicemeeter', 'virtual', 'steam streaming', 'stereo mix'))
 
 
 def audio_info(path):
@@ -218,6 +230,7 @@ class AudioEngine:
         self._output = None
         self.last_error = None
         self.xruns = 0
+        self._mic_processor = None
 
     @property
     def running(self):
@@ -225,24 +238,36 @@ class AudioEngine:
 
     @property
     def healthy(self):
+        if self._mic_processor and not self._mic_processor.healthy:
+            self.last_error = self._mic_processor.error or 'Microphone filter stopped.'
+            return False
         return bool(self._streams) and all(stream.active for stream in self._streams)
 
-    def start(self, output, microphone=None, monitor=None):
+    @property
+    def filter_drops(self):
+        return self._mic_processor.dropped_samples if self._mic_processor else 0
+
+    def start(self, output, microphone=None, monitor=None, *, mic_noise_reduction=False):
         self.stop()
         if monitor and (monitor.index == output.index or monitor.name == output.name):
             raise ValueError('Choose a different device for headphone monitoring.')
-        self.rate = output.rate
+        filtering = bool(microphone and mic_noise_reduction)
+        self.rate = SAMPLE_RATE if filtering else output.rate
         self.last_error = None
         self.xruns = 0
         mic_queue = SampleQueue(int(self.rate * 0.12))
         monitor_queue = SampleQueue(int(self.rate * 0.12))
         channels = min(2, output.outputs)
+        processor = None
 
         def capture(indata, frames, timing, status):
             try:
                 if status:
                     self.xruns += 1
-                mic_queue.push(indata)
+                if processor:
+                    processor.submit(indata[:, 0])
+                else:
+                    mic_queue.push(indata)
             except Exception as exc:
                 self.last_error = str(exc)
                 raise sd.CallbackAbort
@@ -251,8 +276,10 @@ class AudioEngine:
             try:
                 if status:
                     self.xruns += 1
-                mixed, sounds = self.mixer.render(
-                    frames, mic_queue.read(frames) if microphone else None)
+                mic_audio = None
+                if microphone:
+                    mic_audio = processor.read(frames) if processor else mic_queue.read(frames)
+                mixed, sounds = self.mixer.render(frames, mic_audio)
                 outdata[:] = mixed if channels == 2 else mixed.mean(axis=1, keepdims=True)
                 if monitor:
                     monitor_queue.push(sounds)
@@ -274,26 +301,24 @@ class AudioEngine:
 
         common = dict(samplerate=self.rate, dtype='float32', blocksize=0, latency='low')
 
-        def settings(device):
-            # Shared-mode Windows conversion also supports headsets whose native
-            # capture rate differs from the virtual cable's playback rate.
-            return sd.WasapiSettings(auto_convert=True) if device.api == 'Windows WASAPI' else None
-
         try:
+            if filtering:
+                processor = MicrophoneProcessor()
+                self._mic_processor = processor
             if microphone:
                 sd.check_input_settings(device=microphone.index, channels=1,
                                         dtype='float32', samplerate=self.rate,
-                                        extra_settings=settings(microphone))
+                                        extra_settings=device_settings(microphone))
                 self._streams.append(sd.InputStream(device=microphone.index, channels=1,
                                                      callback=capture,
-                                                     extra_settings=settings(microphone), **common))
+                                                     extra_settings=device_settings(microphone), **common))
             if monitor:
                 self._streams.append(sd.OutputStream(device=monitor.index,
                                                      channels=min(2, monitor.outputs),
                                                      callback=listen,
-                                                     extra_settings=settings(monitor), **common))
+                                                     extra_settings=device_settings(monitor), **common))
             self._output = sd.OutputStream(device=output.index, channels=channels,
-                                           callback=render, extra_settings=settings(output), **common)
+                                           callback=render, extra_settings=device_settings(output), **common)
             self._streams.append(self._output)
             for stream in self._streams:
                 stream.start()
@@ -314,4 +339,9 @@ class AudioEngine:
                 pass
         self._streams.clear()
         self._output = None
+        if self._mic_processor:
+            self._mic_processor.stop()
+            if self._mic_processor.error:
+                self.last_error = self._mic_processor.error
+            self._mic_processor = None
         self.mixer.peak = 0

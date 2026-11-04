@@ -2,6 +2,7 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from pathlib import Path
+import json
 import tempfile
 import time
 import unittest
@@ -128,6 +129,42 @@ class WindowTests(unittest.TestCase):
         self.window.refresh_devices()
         self.assertIsNone(self.window.output.currentData())
         self.assertFalse(self.window.connect_route())
+
+    def test_noise_filter_default_persistence_and_control_states(self):
+        self.assertTrue(self.window.mic_noise_reduction.isChecked())
+        self.assertFalse(self.window.mic_noise_reduction.isEnabled())
+        self.assertTrue(self.window.mic_test_button.isEnabled())
+        self.window.mic_enabled.setChecked(True)
+        self.assertTrue(self.window.mic_noise_reduction.isEnabled())
+        self.window.mic_noise_reduction.setChecked(False)
+        self.window.persist()
+        saved = json.loads((self.folder / 'library.json').read_text(encoding='utf-8'))
+        self.assertFalse(saved['mic_noise_reduction'])
+        with patch('soundboard.audio.sd.InputStream', FakeStream), patch('soundboard.audio.sd.check_input_settings'):
+            self.assertTrue(self.window.connect_route())
+        self.assertFalse(self.window.mic_noise_reduction.isEnabled())
+        self.assertFalse(self.window.mic_test_button.isEnabled())
+        self.window.disconnect_route()
+        self.assertTrue(self.window.mic_noise_reduction.isEnabled())
+        self.window.close()
+        self.window = MainWindow(self.folder, register_hotkeys=False)
+        self.assertFalse(self.window.mic_noise_reduction.isChecked())
+        self.assertFalse(self.window.mic_enabled.isChecked())
+
+    def test_missing_filter_is_reported_without_sending_raw_mic(self):
+        self.window.mic_enabled.setChecked(True)
+        with patch('soundboard.audio.MicrophoneProcessor', side_effect=RuntimeError('filter unavailable')):
+            self.assertFalse(self.window.connect_route())
+        self.assertIn('filter unavailable', self.window.banner.text())
+        self.assertFalse(self.window.engine.running)
+
+    def test_filter_failure_disconnects_output(self):
+        with patch.object(self.window.engine, 'start'):
+            self.assertTrue(self.window.connect_route())
+        self.window.engine.last_error = 'Microphone filter failed'
+        self.window.tick()
+        self.assertFalse(self.window.connected)
+        self.assertIn('Microphone filter failed', self.window.banner.text())
 
 
 if __name__ == '__main__':

@@ -14,8 +14,13 @@ from PySide6.QtWidgets import (
 )
 
 from .audio import AudioCache, AudioEngine, audio_info, devices
-from .hotkeys import GlobalHotkeys
+from .hotkeys import (
+    DEFAULT_STOP, STOP_ACTION, GlobalHotkeys, ShortcutError,
+    assign_missing_shortcuts, compile_bindings,
+)
 from .library import DATA_DIR, load_state, new_clip, save_state
+from .mic_test import MicrophoneTestDialog
+from .shortcut_editor import ShortcutEditor
 
 
 STYLE = '''
@@ -59,7 +64,7 @@ QProgressBar::chunk { background: #aa8aef; border-radius: 2px; }
 QProgressBar#meter { max-height: 7px; }
 QProgressBar#meter::chunk { background: #82dfbd; }
 QScrollArea { border: none; background: transparent; }
-QWidget#padContainer { background: transparent; }
+QWidget#padContainer, QWidget#shortcutRows { background: transparent; }
 QScrollBar:vertical { background: #181b25; width: 7px; }
 QScrollBar::handle:vertical { background: #424962; border-radius: 3px; min-height: 25px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -67,7 +72,7 @@ QMenu { background: #252a3b; border: 1px solid #444c66; padding: 5px; }
 QMenu::item { padding: 8px 22px; }
 QMenu::item:selected { background: #4d3b73; }
 QToolTip { color: #e7e9f3; background: #2d3347; border: 1px solid #59647c; }
-QMessageBox, QInputDialog { background: #181b25; }
+QMessageBox, QInputDialog, QDialog { background: #181b25; }
 '''
 
 
@@ -127,8 +132,14 @@ class Pad(QFrame):
         layout.setContentsMargins(16, 12, 16, 14)
         layout.setSpacing(9)
         top = QHBoxLayout()
-        hotkey = f'CTRL + ALT + {index + 1}' if index < 9 else 'CLICK TO PLAY'
-        top.addWidget(label(hotkey, 'section'))
+        hotkey = str(clip.get('shortcut') or 'No shortcut')
+        self.shortcut_label = label(hotkey, 'muted')
+        self.shortcut_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        unavailable = window.hotkeys.failed.get(clip['id']) if window.hotkeys else None
+        self.shortcut_label.setToolTip(unavailable or hotkey)
+        if unavailable:
+            self.shortcut_label.setText(hotkey + ' (unavailable)')
+        top.addWidget(self.shortcut_label, 1)
         top.addStretch()
         more = button('···', lambda: self.menu(window), 'more')
         more.setAccessibleName(f'Options for {clip["name"]}')
@@ -166,6 +177,7 @@ class Pad(QFrame):
 
     def menu(self, window):
         menu = QMenu(self)
+        menu.addAction('Edit shortcut...', lambda: window.edit_shortcuts(self.clip['id']))
         menu.addAction('Rename', lambda: window.rename_clip(self.clip))
         menu.addAction('Remove from board', lambda: window.remove_clip(self.clip))
         menu.exec(self.mapToGlobal(self.rect().topRight()))
@@ -189,6 +201,8 @@ class MainWindow(QMainWindow):
         self.state_path = self.data_dir / 'library.json'
         self.state, warning = load_state(self.state_path)
         self.clips = self.state.get('clips', [])
+        self.stop_shortcut = self.state.get('stop_shortcut', DEFAULT_STOP)
+        assign_missing_shortcuts(self.clips, self.stop_shortcut)
         self.engine = AudioEngine()
         self.cache = AudioCache()
         self.pool = QThreadPool(self)
@@ -219,10 +233,9 @@ class MainWindow(QMainWindow):
         self.escape = QShortcut(QKeySequence('Escape'), self)
         self.escape.activated.connect(self.stop_sounds)
         if register_hotkeys:
-            self.hotkeys = GlobalHotkeys(QApplication.instance(), self.play_index, self.stop_sounds)
-            if self.hotkeys.failed:
-                self.notice('Some hotkeys are in use by another app: ' + ', '.join(
-                    f'Ctrl+Alt+{number}' for number in self.hotkeys.failed) + '. Pads still work by clicking.')
+            self.hotkeys = GlobalHotkeys(QApplication.instance(), self.activate_shortcut)
+            self.sync_shortcuts()
+            self.render_cards()
         if warning:
             self.notice(warning)
 
@@ -295,12 +308,21 @@ class MainWindow(QMainWindow):
         empty_layout.addWidget(self.demo_button, alignment=Qt.AlignmentFlag.AlignCenter)
         empty_layout.addStretch()
         left.addWidget(self.empty, 1)
-        left.addWidget(label('CTRL + ALT + 1–9  Play / stop pads     ·     CTRL + ALT + 0  Stop sounds', 'muted'))
+        shortcuts = QHBoxLayout()
+        self.shortcut_hint = label('', 'muted', True)
+        self.refresh_shortcut_hint()
+        shortcuts.addWidget(self.shortcut_hint, 1)
+        shortcuts.addWidget(button('Shortcuts...', lambda: self.edit_shortcuts()))
+        left.addLayout(shortcuts)
         body.addLayout(left, 1)
 
         panel = QFrame()
         panel.setObjectName('panel')
-        panel.setFixedWidth(330)
+        self.routing_scroll = QScrollArea()
+        self.routing_scroll.setFixedWidth(340)
+        self.routing_scroll.setWidgetResizable(True)
+        self.routing_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.routing_scroll.setWidget(panel)
         routing = QVBoxLayout(panel)
         routing.setContentsMargins(20, 20, 20, 20)
         routing.setSpacing(12)
@@ -330,6 +352,15 @@ class MainWindow(QMainWindow):
         self.microphone.setAccessibleName('Physical microphone')
         routing.addWidget(self.microphone)
         self.mic_slider = self.add_slider(routing, 'Mic volume', self.safe_level('mic_gain', 100), self.set_mic_gain)
+        self.mic_noise_reduction = QCheckBox('Reduce microphone noise')
+        self.mic_noise_reduction.setChecked(self.state.get('mic_noise_reduction', True) is not False)
+        self.mic_noise_reduction.setToolTip('Reduce fan noise and typing on your microphone only. '
+                                          'Disconnect output to change this setting.')
+        routing.addWidget(self.mic_noise_reduction)
+        routing.addWidget(label('Filters your mic only. Turn off Discord’s noise suppression, '
+                                'echo cancellation, and automatic gain.', 'muted', True))
+        self.mic_test_button = button('Test microphone…', self.test_microphone)
+        routing.addWidget(self.mic_test_button)
         self.monitor_enabled = QCheckBox('Hear sounds in my headphones')
         self.monitor_enabled.setToolTip('Monitor sound pads only. Your microphone is not played back to you.')
         routing.addWidget(self.monitor_enabled)
@@ -347,7 +378,7 @@ class MainWindow(QMainWindow):
         routing.addWidget(self.meter)
         self.level_text = label('Output stopped', 'muted')
         routing.addWidget(self.level_text)
-        body.addWidget(panel)
+        body.addWidget(self.routing_scroll)
         outer.addLayout(body, 1)
         self.banner = label('', 'notice', True)
         self.banner.hide()
@@ -362,6 +393,7 @@ class MainWindow(QMainWindow):
             combo.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             combo.currentIndexChanged.connect(self.device_changed)
         self.mic_enabled.toggled.connect(self.device_changed)
+        self.mic_noise_reduction.toggled.connect(self.device_changed)
         self.monitor_enabled.toggled.connect(self.device_changed)
         self.set_sound_gain(self.sound_slider.value())
         self.set_mic_gain(self.mic_slider.value())
@@ -443,6 +475,8 @@ class MainWindow(QMainWindow):
         self.microphone.setEnabled(self.mic_enabled.isChecked() and not self.connected)
         self.monitor.setEnabled(self.monitor_enabled.isChecked() and not self.connected)
         self.mic_slider.setEnabled(self.mic_enabled.isChecked())
+        self.mic_noise_reduction.setEnabled(self.mic_enabled.isChecked() and not self.connected)
+        self.mic_test_button.setEnabled(self.microphone.currentData() is not None and not self.connected)
         output = self.output.currentData()
         for combo in (self.output, self.microphone, self.monitor):
             device = combo.currentData()
@@ -457,6 +491,17 @@ class MainWindow(QMainWindow):
             self.disconnect_route()
         else:
             self.connect_route()
+
+    def test_microphone(self):
+        microphone = self.microphone.currentData()
+        if self.connected or microphone is None:
+            return
+        try:
+            dialog = MicrophoneTestDialog(microphone, devices(), self.monitor.currentData(), self)
+            dialog.exec()
+            dialog.deleteLater()
+        except Exception as exc:
+            self.notice(f'Could not open the microphone test: {exc}')
 
     def connect_route(self):
         output = self.output.currentData()
@@ -477,16 +522,19 @@ class MainWindow(QMainWindow):
                 self.notice('Choose your physical microphone. The selected cable feeds back into itself.')
                 return False
         try:
-            self.engine.start(output, microphone, monitor)
+            self.engine.start(output, microphone, monitor,
+                              mic_noise_reduction=self.mic_noise_reduction.isChecked())
         except Exception as exc:
             self.notice(f'Could not start audio: {exc}. Check device availability and microphone access. If formats differ, set devices to the same sample rate in Windows Sound settings.')
             return False
         self.connected = True
         self.route_button.setText('Disconnect output')
-        for control in (self.output, self.microphone, self.monitor, self.mic_enabled, self.monitor_enabled):
+        for control in (self.output, self.microphone, self.monitor, self.mic_enabled,
+                        self.monitor_enabled, self.mic_noise_reduction, self.mic_test_button):
             control.setEnabled(False)
         self.notice('')
-        self.status.setText(f'Connected · {output.name} · {self.engine.rate:,} Hz')
+        filter_note = ' · Mic noise reduction on' if microphone and self.mic_noise_reduction.isChecked() else ''
+        self.status.setText(f'Connected · {output.name} · {self.engine.rate:,} Hz{filter_note}')
         return True
 
     def disconnect_route(self):
@@ -545,11 +593,15 @@ class MainWindow(QMainWindow):
             known = {c['path'].casefold() for c in self.clips}
             accepted = [c for c in accepted if c['path'].casefold() not in known]
             self.clips.extend(accepted)
+            assign_missing_shortcuts(self.clips, self.stop_shortcut)
+            self.sync_shortcuts(report=False)
             self.search.clear()
             self.render_cards()
             self.save_timer.start()
             self.status.setText(f'Added {len(accepted)} sound(s). Click a pad to play.')
             self.notice('\n'.join(errors[:4]) + (f'\n…and {len(errors) - 4} more.' if len(errors) > 4 else ''))
+            if not errors:
+                self.report_shortcut_errors()
         self.run_task(inspect, imported)
 
     def add_demos(self):
@@ -619,9 +671,74 @@ class MainWindow(QMainWindow):
                 self.notice(f'Could not play {clip["name"]}: {message}')
         self.run_task(lambda: self.cache.load(clip['path'], rate), ready, failed)
 
-    def play_index(self, index):
-        if index < len(self.clips) and not QApplication.activeModalWidget():
-            self.trigger(self.clips[index]['id'])
+    def shortcut_bindings(self):
+        return {STOP_ACTION: self.stop_shortcut,
+                **{clip['id']: clip.get('shortcut', '') for clip in self.clips}}
+
+    def shortcut_names(self):
+        return {STOP_ACTION: 'Stop sounds', **{clip['id']: clip['name'] for clip in self.clips}}
+
+    def activate_shortcut(self, action):
+        if self.closing:
+            return
+        if action == STOP_ACTION:
+            self.stop_sounds()
+        elif not QApplication.activeModalWidget():
+            self.trigger(action)
+
+    def refresh_shortcut_hint(self):
+        stop = self.stop_shortcut or 'No global shortcut'
+        self.shortcut_hint.setText(f'Stop sounds: {stop}  ·  Esc while focused')
+        error = self.hotkeys.failed.get(STOP_ACTION) if self.hotkeys else None
+        self.shortcut_hint.setToolTip(error or '')
+
+    def report_shortcut_errors(self):
+        if self.hotkeys and self.hotkeys.failed:
+            names = self.shortcut_names()
+            details = [f'{names.get(action, action)}: {error}'
+                       for action, error in self.hotkeys.failed.items()]
+            self.notice('Some shortcuts are unavailable. Open Shortcuts to change them.\n' + '\n'.join(details[:4]))
+
+    def sync_shortcuts(self, report=True):
+        if self.hotkeys:
+            self.hotkeys.configure(self.shortcut_bindings())
+        if report:
+            self.report_shortcut_errors()
+
+    def apply_shortcuts(self, changes):
+        # Keep sounds that finished importing after the editor was opened.
+        bindings = self.shortcut_bindings()
+        bindings.update({action: text for action, text in changes.items() if action in bindings})
+        valid, errors = compile_bindings(bindings, self.shortcut_names())
+        if errors:
+            action, message = next(iter(errors.items()))
+            raise ShortcutError(f'{self.shortcut_names()[action]}: {message}')
+        bindings = {action: valid[action].text if action in valid else '' for action in bindings}
+        if self.hotkeys:
+            self.hotkeys.configure(bindings, strict=True)
+        self.stop_shortcut = bindings[STOP_ACTION]
+        for clip in self.clips:
+            clip['shortcut'] = bindings[clip['id']]
+        self.refresh_shortcut_hint()
+        self.render_cards()
+        self.notice('')
+        self.persist()
+
+    def edit_shortcuts(self, selected=None):
+        if self.hotkeys:
+            self.hotkeys.suspend()
+        try:
+            names = self.shortcut_names()
+            actions = [(action, names[action], text) for action, text in self.shortcut_bindings().items()]
+            dialog = ShortcutEditor(self, actions, self.apply_shortcuts, selected)
+            dialog.exec()
+            dialog.deleteLater()
+        finally:
+            if self.hotkeys and self.hotkeys.paused and not self.closing:
+                self.hotkeys.resume()
+            self.refresh_shortcut_hint()
+            self.render_cards()
+            self.report_shortcut_errors()
 
     def stop_sounds(self):
         self.pending.clear()
@@ -645,6 +762,7 @@ class MainWindow(QMainWindow):
         self.pending.pop(clip['id'], None)
         self.engine.mixer.stop(clip['id'])
         self.clips.remove(clip)
+        self.sync_shortcuts()
         self.render_cards()
         self.save_timer.start()
 
@@ -690,10 +808,13 @@ class MainWindow(QMainWindow):
         else:
             db = f'{20 * math.log10(peak):.0f} dB' if peak > 0.00001 else 'Silent'
             suffix = f' · {self.engine.xruns} audio dropouts' if self.engine.xruns else ''
+            if self.engine.filter_drops:
+                suffix += ' · Filter buffer overflow'
             self.level_text.setText(f'● Live · {db}{suffix}')
 
     def persist(self):
-        state = dict(clips=self.clips, sound_gain=self.sound_slider.value(), mic_gain=self.mic_slider.value())
+        state = dict(clips=self.clips, sound_gain=self.sound_slider.value(), mic_gain=self.mic_slider.value(),
+                     mic_noise_reduction=self.mic_noise_reduction.isChecked(), stop_shortcut=self.stop_shortcut)
         for name, combo in [('output', self.output), ('microphone', self.microphone), ('monitor', self.monitor)]:
             item = combo.currentData()
             state[name] = item.key if item else self.state.get(name)
@@ -713,7 +834,12 @@ class MainWindow(QMainWindow):
             '3. In Discord, your game, or your recorder, select CABLE Output as the microphone/input.\n\n'
             '4. To include your voice, enable “Mix in my microphone” and choose your physical microphone. '
             'Use headphones when routing a live mic to avoid speaker feedback.\n\n'
-            '5. Start output and click a pad. If clips sound muffled, turn off noise suppression and automatic gain in the receiving app.\n\n'
+            '5. Leave “Reduce microphone noise” enabled to filter your voice without filtering sound files. '
+            'Use “Test microphone” before connecting to compare original and filtered audio.\n\n'
+            '6. In Discord, turn off noise suppression (including Krisp), echo cancellation, and automatic gain control. '
+            'If needed, select the Custom input profile to access these settings. '
+            'Set input sensitivity low enough to pass quiet clips, or hold push-to-talk throughout playback.\n\n'
+            '7. Start output and click a pad. Soundboard filters your microphone locally; Discord receives the combined audio.\n\n'
             'Stop sounds leaves the mic connected. Disconnect output stops both. '
             'The app does not install drivers or change Windows default devices.')
         download = box.addButton('Open VB-CABLE website', QMessageBox.ButtonRole.ActionRole)
